@@ -115,6 +115,105 @@ interface OracleDetails {
 	exitCode: number | null;
 }
 
+function emptyUsage(): UsageStats {
+	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, turns: 0 };
+}
+
+function normalizeUsage(rawUsage: unknown): UsageStats {
+	if (!rawUsage || typeof rawUsage !== "object") return emptyUsage();
+	const usage = rawUsage as Partial<UsageStats>;
+	return {
+		input: Number(usage.input ?? 0),
+		output: Number(usage.output ?? 0),
+		cacheRead: Number(usage.cacheRead ?? 0),
+		cacheWrite: Number(usage.cacheWrite ?? 0),
+		totalTokens: Number(usage.totalTokens ?? 0),
+		cost: Number(usage.cost ?? 0),
+		turns: Number(usage.turns ?? 0),
+	};
+}
+
+function normalizeToolStatus(status: unknown): OracleToolStatus {
+	if (status === "queued" || status === "in-progress" || status === "done" || status === "error" || status === "cancelled") {
+		return status;
+	}
+	return "done";
+}
+
+function normalizeToolUse(rawTool: unknown, index: number): OracleToolUse {
+	const tool = rawTool && typeof rawTool === "object" ? (rawTool as Partial<OracleToolUse>) : {};
+	return {
+		id: String(tool.id ?? `legacy-tool-${index}`),
+		name: String(tool.name ?? "tool"),
+		status: normalizeToolStatus(tool.status),
+		input: tool.input,
+		resultPreview: typeof tool.resultPreview === "string" ? tool.resultPreview : undefined,
+		errorPreview: typeof tool.errorPreview === "string" ? tool.errorPreview : undefined,
+		startedAt: typeof tool.startedAt === "number" ? tool.startedAt : undefined,
+		endedAt: typeof tool.endedAt === "number" ? tool.endedAt : undefined,
+	};
+}
+
+function normalizeTranscript(rawTranscript: unknown): OracleTranscriptTurn[] {
+	if (!Array.isArray(rawTranscript)) return [];
+	return rawTranscript.map((rawTurn, index) => {
+		const turn = rawTurn && typeof rawTurn === "object" ? (rawTurn as Partial<OracleTranscriptTurn>) : {};
+		return {
+			id: String(turn.id ?? `turn-${index + 1}`),
+			message: typeof turn.message === "string" ? turn.message : "",
+			reasoning: typeof turn.reasoning === "string" ? turn.reasoning : "",
+			isThinking: Boolean(turn.isThinking),
+			toolUses: Array.isArray(turn.toolUses) ? turn.toolUses.map(normalizeToolUse) : [],
+		};
+	});
+}
+
+function normalizeOracleDetails(rawDetails: unknown, outputText: string): OracleDetails | undefined {
+	if (!rawDetails || typeof rawDetails !== "object") return undefined;
+	const raw = rawDetails as Record<string, unknown>;
+	const transcript = normalizeTranscript(raw.transcript);
+
+	if (transcript.length === 0) {
+		const legacyMessage = typeof raw.currentMessage === "string" ? raw.currentMessage : outputText;
+		const legacyReasoning = typeof raw.currentReasoning === "string" ? raw.currentReasoning : "";
+		const legacyTools = Array.isArray(raw.activeTools) ? raw.activeTools.map(normalizeToolUse) : [];
+		if (legacyMessage || legacyReasoning || legacyTools.length > 0) {
+			transcript.push({
+				id: "legacy-turn-1",
+				message: legacyMessage,
+				reasoning: legacyReasoning,
+				isThinking: Boolean(raw.isThinking),
+				toolUses: legacyTools,
+			});
+		}
+	}
+
+	const rawStatus = raw.status;
+	const status: OracleRunStatus =
+		rawStatus === "starting" || rawStatus === "in-progress" || rawStatus === "done" || rawStatus === "error" || rawStatus === "cancelled"
+			? rawStatus
+			: outputText.trim()
+				? "done"
+				: "in-progress";
+
+	return {
+		status,
+		model: String(raw.model ?? ORACLE_MODEL),
+		thinking: String(raw.thinking ?? ORACLE_THINKING),
+		cwd: String(raw.cwd ?? process.cwd()),
+		files: Array.isArray(raw.files) ? raw.files.filter((file): file is string => typeof file === "string") : [],
+		missingFiles: Array.isArray(raw.missingFiles)
+			? raw.missingFiles.filter((file): file is string => typeof file === "string")
+			: [],
+		transcript,
+		currentTurnId: typeof raw.currentTurnId === "string" ? raw.currentTurnId : transcript.at(-1)?.id,
+		finalAnswer: typeof raw.finalAnswer === "string" ? raw.finalAnswer : outputText,
+		errorMessage: typeof raw.errorMessage === "string" ? raw.errorMessage : undefined,
+		usage: normalizeUsage(raw.usage),
+		exitCode: typeof raw.exitCode === "number" ? raw.exitCode : null,
+	};
+}
+
 function normalizeExtensionPath(filePath: string): string {
 	if (process.platform === "win32" && filePath.startsWith("/") && /^[A-Za-z]:/.test(filePath.slice(1, 3))) {
 		return filePath.slice(1);
@@ -971,7 +1070,7 @@ Do not use it for simple file reads/searches, codebase searches the main agent c
 		},
 		renderResult(result, { expanded, isPartial }, theme, context) {
 			const text = textFromResult(result);
-			const details = result.details as OracleDetails | undefined;
+			const details = normalizeOracleDetails(result.details, text);
 			const params = context.args as OracleParams;
 			const component =
 				context.lastComponent instanceof OracleTraceComponent ? context.lastComponent : new OracleTraceComponent();
