@@ -6,7 +6,7 @@ It adds an `oracle` tool that the main agent can call when it wants a second, hi
 
 The Oracle runs in an isolated nested `pi --mode json --no-session` process. It is advisory only: it can read/search local files and consult the web, but it does not edit files or run shell commands.
 
-While the nested Oracle is running, the tool streams a live trace instead of leaving you staring at a black-box `Working...` state. The collapsed view stays compact, while expanding the Oracle tool row shows the Oracle's streamed answer text, reasoning when the model exposes it, queued/running tool calls, completed tool results, and tool errors in order. Completed or failed tools are kept in the trace instead of being mislabeled as active work.
+While the nested Oracle is running, the tool streams a live trace instead of leaving you staring at a black-box `Working...` state. The Oracle row stays compact by default, with a clickable arrow-style header for opening the trace. Inside the trace, answer, reasoning, and tool blocks are rendered as their own arrow sections so you can expand the parts you care about. Completed or failed tools are kept in the trace instead of being mislabeled as active work.
 
 ## Inspiration and Good-Faith Note
 
@@ -102,9 +102,9 @@ The main agent can also call the tool directly:
 
 ## Live Oracle Trace
 
-When Oracle starts, pi shows a compact live status line with the current activity, active queued/running tools, token/cost details when available, and a preview of the answer or latest trace.
+When Oracle starts, pi shows a compact live status box with the current activity, active queued/running tools, token/cost details when available, and a preview of the answer or latest trace.
 
-Expand the Oracle tool row with pi's normal tool-expand keybinding to inspect the full trace:
+Open the Oracle row with the arrow header to inspect the trace:
 
 - streamed Oracle answer text
 - reasoning blocks, when the nested model/provider emits reasoning text
@@ -113,6 +113,8 @@ Expand the Oracle tool row with pi's normal tool-expand keybinding to inspect th
 - the final Oracle answer once the nested run finishes
 
 If the nested model does not expose reasoning text, the trace still shows that Oracle is thinking and continues to stream message and tool activity as it becomes available.
+
+The extension enables terminal mouse tracking for the interactive trace when Pi is running in TUI mode. In terminals that do not send SGR mouse events, the arrows still render as stable section headers.
 
 ## What the Oracle Can Do
 

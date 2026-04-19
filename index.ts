@@ -5,8 +5,8 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
-import { keyHint, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { ProcessTerminal, Text, TUI, type Component } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 
 const ORACLE_MODEL = process.env.PI_ORACLE_MODEL || "openai-codex/gpt-5.4";
@@ -364,15 +364,6 @@ function textFromResult(result: { content: Array<{ type: string; text?: string }
 		.trim();
 }
 
-function indentBlock(text: string, spaces = 2): string {
-	const prefix = " ".repeat(spaces);
-	return text
-		.replace(/\r\n/g, "\n")
-		.split("\n")
-		.map((line) => `${prefix}${line}`)
-		.join("\n");
-}
-
 function statusLabel(status: OracleToolStatus): string {
 	switch (status) {
 		case "queued":
@@ -388,136 +379,293 @@ function statusLabel(status: OracleToolStatus): string {
 	}
 }
 
-function renderToolUse(tool: OracleToolUse, theme: any, expanded: boolean): string {
-	const statusColor = tool.status === "error" ? "error" : tool.status === "done" ? "success" : "warning";
-	const lines = [
-		`${theme.fg("muted", "tool")} ${theme.fg("toolTitle", tool.name)} ${theme.fg(statusColor, statusLabel(tool.status))}`,
-		indentBlock(formatToolInput(tool.name, tool.input), 2),
-	];
+const CLICK_MARKER_PREFIX = "\x1b_pi:click:";
+const CLICK_MARKER_SUFFIX = "\x07";
 
-	const preview = tool.status === "error" ? tool.errorPreview : tool.resultPreview;
-	if (preview && expanded) {
-		lines.push(indentBlock(tool.status === "error" ? "Error:" : "Result:", 2));
-		lines.push(indentBlock(truncateText(preview, 1600), 4));
-	} else if (preview) {
-		lines.push(indentBlock(truncateOneLine(preview, 160), 2));
-	}
-
-	return lines.join("\n");
+function clickHandlers(): Map<string, () => void> {
+	const global = globalThis as typeof globalThis & { __PI_TUI_CLICK_HANDLERS__?: Map<string, () => void> };
+	if (!global.__PI_TUI_CLICK_HANDLERS__) global.__PI_TUI_CLICK_HANDLERS__ = new Map();
+	return global.__PI_TUI_CLICK_HANDLERS__;
 }
 
-function renderOracleTrace(details: OracleDetails, theme: any, expanded: boolean): string {
+function sanitizeClickId(value: string): string {
+	return value.replace(/[^A-Za-z0-9_.:-]/g, "_");
+}
+
+function clickable(id: string, handler: () => void): string {
+	const safeId = sanitizeClickId(id);
+	clickHandlers().set(safeId, handler);
+	return `${CLICK_MARKER_PREFIX}${safeId}${CLICK_MARKER_SUFFIX}`;
+}
+
+function parseMouseEvent(data: string): { code: number; x: number; y: number; kind: "press" | "release" } | undefined {
+	const match = data.match(/^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/);
+	if (!match) return undefined;
+	return {
+		code: Number(match[1]),
+		x: Number(match[2]),
+		y: Number(match[3]),
+		kind: match[4] === "m" ? "release" : "press",
+	};
+}
+
+function installClickableTraceRuntimePatch() {
+	const global = globalThis as typeof globalThis & { __PI_ORACLE_CLICK_PATCH__?: boolean };
+	if (global.__PI_ORACLE_CLICK_PATCH__) return;
+	global.__PI_ORACLE_CLICK_PATCH__ = true;
+
+	const tuiProto = (TUI as any).prototype;
+	if (typeof tuiProto.extractClickMarkers !== "function" && typeof tuiProto.applyLineResets === "function") {
+		const originalApplyLineResets = tuiProto.applyLineResets;
+		tuiProto.applyLineResets = function patchedApplyLineResets(lines: string[]) {
+			this.clickableRows = new Map<number, string[]>();
+			for (let row = 0; row < lines.length; row++) {
+				const ids: string[] = [];
+				lines[row] = lines[row].replace(/\x1b_pi:click:([A-Za-z0-9_.:-]+)\x07/g, (_match, id) => {
+					ids.push(id);
+					return "";
+				});
+				if (ids.length > 0) this.clickableRows.set(row, ids);
+			}
+			return originalApplyLineResets.call(this, lines);
+		};
+	}
+
+	if (typeof tuiProto.handleMouse !== "function" && typeof tuiProto.handleInput === "function") {
+		const originalHandleInput = tuiProto.handleInput;
+		tuiProto.handleInput = function patchedHandleInput(data: string) {
+			const mouse = parseMouseEvent(data);
+			if (mouse?.kind === "press" && (mouse.code & 3) === 0) {
+				const row = (this.previousViewportTop ?? 0) + mouse.y - 1;
+				const ids = this.clickableRows?.get(row) as string[] | undefined;
+				if (ids?.length) {
+					const handlers = clickHandlers();
+					for (const id of ids) {
+						const handler = handlers.get(id);
+						if (handler) {
+							handler();
+							this.requestRender?.();
+							return;
+						}
+					}
+				}
+			}
+			return originalHandleInput.call(this, data);
+		};
+	}
+
+	const terminalProto = (ProcessTerminal as any).prototype;
+	if (!terminalProto.__piOracleMousePatch) {
+		terminalProto.__piOracleMousePatch = true;
+		const originalStart = terminalProto.start;
+		const originalStop = terminalProto.stop;
+		terminalProto.start = function patchedStart(...args: unknown[]) {
+			const result = originalStart.apply(this, args);
+			process.stdout.write("\x1b[?1000h\x1b[?1006h");
+			return result;
+		};
+		terminalProto.stop = function patchedStop(...args: unknown[]) {
+			process.stdout.write("\x1b[?1000l\x1b[?1006l");
+			return originalStop.apply(this, args);
+		};
+	}
+
+	process.stdout.write("\x1b[?1000h\x1b[?1006h");
+}
+
+function stripAnsi(text: string): string {
+	return text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "");
+}
+
+function visibleLength(text: string): number {
+	return stripAnsi(text).length;
+}
+
+function padRight(text: string, width: number): string {
+	return text + " ".repeat(Math.max(0, width - visibleLength(text)));
+}
+
+function fitLine(text: string, width: number): string {
+	const plain = stripAnsi(text);
+	if (plain.length <= width) return text;
+	return `${plain.slice(0, Math.max(0, width - 3)).trimEnd()}...`;
+}
+
+function simpleWrap(text: string, width: number): string[] {
+	const clean = text.replace(/\r\n/g, "\n").trim();
+	if (!clean) return [];
 	const lines: string[] = [];
-	const turns = expanded ? details.transcript : details.transcript.slice(-1);
-	const skipped = details.transcript.length - turns.length;
-	if (skipped > 0) lines.push(theme.fg("muted", `... ${skipped} earlier Oracle step${skipped === 1 ? "" : "s"}`));
-
-	for (const turn of turns) {
-		const message = turn.message.trim();
-		const reasoning = turn.reasoning.trim();
-
-		if (message) {
-			lines.push(theme.fg("toolOutput", expanded ? message : truncateText(message, 700)));
-		} else if (turn.isThinking) {
-			lines.push(theme.fg("warning", "Oracle is thinking..."));
+	for (const rawLine of clean.split("\n")) {
+		let line = rawLine.trimEnd();
+		while (line.length > width) {
+			lines.push(line.slice(0, width));
+			line = line.slice(width);
 		}
-
-		if (reasoning) {
-			lines.push("");
-			lines.push(theme.fg("muted", "Reasoning"));
-			lines.push(indentBlock(expanded ? reasoning : truncateText(reasoning, 700), 2));
-		} else if (turn.isThinking) {
-			lines.push(theme.fg("muted", "Reasoning stream has started; no text emitted yet."));
-		}
-
-		for (const tool of turn.toolUses) {
-			lines.push("");
-			lines.push(renderToolUse(tool, theme, expanded));
-		}
+		lines.push(line);
 	}
-
-	return lines.join("\n").trim();
+	return lines;
 }
 
-function renderOracleCollapsed(
-	args: OracleParams,
-	details: OracleDetails | undefined,
-	outputText: string,
-	isPartial: boolean,
-	theme: any,
-): string {
-	if (!details) return outputText || "Oracle answered";
+class OracleTraceComponent implements Component {
+	private params: OracleParams = { task: "" };
+	private details?: OracleDetails;
+	private outputText = "";
+	private isPartial = true;
+	private theme: any;
+	private invalidateRow: () => void = () => {};
+	private oracleExpanded = false;
+	private sections = new Map<string, boolean>();
+	private instanceId = Math.random().toString(36).slice(2);
 
-	const activity = currentActivity(details);
-	const usage = formatUsage(details.usage);
-	const lines = [
-		`${theme.fg("toolTitle", theme.bold("oracle"))} ${theme.fg(details.status === "error" ? "error" : isPartial ? "warning" : "success", activity)}`,
-		theme.fg("muted", truncateOneLine(args.task ?? "", 180)),
-	];
-
-	const activeTools = getActiveToolUses(details);
-	if (activeTools.length > 0) {
-		lines.push(theme.fg("muted", "Current tools:"));
-		for (const tool of activeTools.slice(-4)) lines.push(`  ${statusLabel(tool.status)} ${formatToolInput(tool.name, tool.input)}`);
+	update(
+		params: OracleParams,
+		details: OracleDetails | undefined,
+		outputText: string,
+		isPartial: boolean,
+		theme: any,
+		invalidate: () => void,
+		fallbackExpanded: boolean,
+	): void {
+		this.params = params;
+		this.details = details;
+		this.outputText = outputText;
+		this.isPartial = isPartial;
+		this.theme = theme;
+		this.invalidateRow = invalidate;
+		if (fallbackExpanded) this.oracleExpanded = true;
 	}
 
-	const finalText = (details.finalAnswer || outputText).trim();
-	const latestTrace = renderOracleTrace(details, theme, false);
-	const preview = finalText || latestTrace;
-	if (preview) {
-		lines.push("");
-		lines.push(truncateText(preview, isPartial ? 900 : 1400));
+	invalidate(): void {}
+
+	render(width: number): string[] {
+		const innerWidth = Math.max(24, width - 4);
+		const details = this.details;
+		const theme = this.theme;
+		const title = details
+			? `${this.statusGlyph(details)} oracle ${theme.fg(details.status === "error" ? "error" : details.status === "done" ? "success" : "warning", currentActivity(details))}`
+			: "oracle";
+		const topId = `${this.instanceId}:oracle`;
+		const arrow = this.oracleExpanded ? "▾" : "▸";
+		const lines: string[] = [];
+
+		lines.push(`╭─${clickable(topId, () => this.toggleOracle())}${arrow} ${title}`);
+		if (!this.oracleExpanded) {
+			lines.push(...this.renderCollapsed(innerWidth));
+		} else {
+			lines.push(...this.renderExpanded(innerWidth));
+		}
+		lines.push("╰" + "─".repeat(Math.min(innerWidth + 2, 96)));
+		return lines;
 	}
 
-	const footerParts = [];
-	if (usage) footerParts.push(usage);
-	footerParts.push(keyHint("app.tools.expand", "to inspect Oracle trace"));
-	lines.push("");
-	lines.push(theme.fg("dim", footerParts.join(" | ")));
-	return lines.join("\n");
-}
-
-function renderOracleExpanded(
-	args: OracleParams,
-	details: OracleDetails | undefined,
-	outputText: string,
-	isPartial: boolean,
-	theme: any,
-): string {
-	if (!details) return outputText || "Oracle answered";
-
-	const usage = formatUsage(details.usage);
-	const lines = [
-		`${theme.fg("toolTitle", theme.bold("oracle"))} ${theme.fg(details.status === "error" ? "error" : isPartial ? "warning" : "success", currentActivity(details))}`,
-		`${theme.fg("muted", "Task:")} ${theme.fg("dim", args.task ?? "")}`,
-		`${theme.fg("muted", "Model:")} ${theme.fg("dim", `${details.model} (${details.thinking} thinking)`)}`,
-	];
-
-	if (details.files.length > 0) lines.push(`${theme.fg("muted", "Files:")} ${details.files.map((file) => path.basename(file)).join(", ")}`);
-	if (details.missingFiles.length > 0) lines.push(`${theme.fg("warning", "Missing files:")} ${details.missingFiles.join(", ")}`);
-	if (usage) lines.push(theme.fg("dim", usage));
-	if (details.errorMessage) lines.push(theme.fg("error", details.errorMessage));
-
-	const finalText = (details.finalAnswer || (!isPartial ? outputText : "")).trim();
-	if (finalText) {
-		lines.push("");
-		lines.push(theme.fg("muted", "--- Oracle answer ---"));
-		lines.push(theme.fg("toolOutput", finalText));
+	private toggleOracle(): void {
+		this.oracleExpanded = !this.oracleExpanded;
+		this.invalidateRow();
 	}
 
-	const trace = renderOracleTrace(details, theme, true);
-	if (trace) {
-		lines.push("");
-		lines.push(theme.fg("muted", "--- Oracle trace ---"));
-		lines.push(trace);
+	private toggleSection(id: string): void {
+		this.sections.set(id, !this.sections.get(id));
+		this.invalidateRow();
 	}
 
-	if (details.status === "done") {
-		lines.push("");
-		lines.push(theme.fg("success", "Oracle finished."));
+	private statusGlyph(details: OracleDetails): string {
+		if (details.status === "done") return "✓";
+		if (details.status === "error") return "✗";
+		const frames = ["◐", "◓", "◑", "◒"];
+		return frames[Math.floor(Date.now() / 250) % frames.length] ?? "◐";
 	}
 
-	return lines.join("\n");
+	private renderCollapsed(width: number): string[] {
+		const details = this.details;
+		if (!details) return [`│ ${fitLine(this.outputText || "Waiting for Oracle...", width)}`];
+		const lines: string[] = [];
+		const usage = formatUsage(details.usage);
+		lines.push(`│ ${this.theme.fg("muted", fitLine(this.params.task, width))}`);
+
+		const activeTools = getActiveToolUses(details);
+		if (activeTools.length > 0) {
+			for (const tool of activeTools.slice(-3)) {
+				lines.push(`│ ${this.theme.fg("warning", "running")} ${fitLine(formatToolInput(tool.name, tool.input), width - 10)}`);
+			}
+		} else if (details.status === "done") {
+			const preview = truncateOneLine(details.finalAnswer || this.outputText, width);
+			if (preview) lines.push(`│ ${this.theme.fg("toolOutput", preview)}`);
+		} else {
+			const latest = getLatestTurn(details);
+			const preview = latest?.message.trim() || latest?.reasoning.trim();
+			lines.push(`│ ${this.theme.fg("dim", fitLine(preview ? truncateOneLine(preview, width) : "click arrow to inspect trace", width))}`);
+		}
+
+		const footer = [usage, "click arrow to expand"].filter(Boolean).join(" | ");
+		lines.push(`│ ${this.theme.fg("dim", fitLine(footer, width))}`);
+		return lines;
+	}
+
+	private renderExpanded(width: number): string[] {
+		const details = this.details;
+		if (!details) return [`│ ${fitLine(this.outputText || "Waiting for Oracle...", width)}`];
+		const lines: string[] = [
+			`│ ${this.theme.fg("muted", "Task:")} ${fitLine(this.params.task, width - 6)}`,
+			`│ ${this.theme.fg("muted", "Model:")} ${this.theme.fg("dim", fitLine(`${details.model} (${details.thinking})`, width - 7))}`,
+		];
+		const usage = formatUsage(details.usage);
+		if (usage) lines.push(`│ ${this.theme.fg("dim", usage)}`);
+		if (details.errorMessage) lines.push(`│ ${this.theme.fg("error", fitLine(details.errorMessage, width))}`);
+
+		const finalAnswer = (details.finalAnswer || (!this.isPartial ? this.outputText : "")).trim();
+		if (finalAnswer) {
+			lines.push(...this.renderSection("answer", "Oracle answer", finalAnswer, width, details.status === "done"));
+		}
+
+		details.transcript.forEach((turn, index) => {
+			const label = `step ${index + 1}`;
+			const message = turn.message.trim();
+			if (message) lines.push(...this.renderSection(`${turn.id}:message`, `${label} message`, message, width, true));
+			else if (turn.isThinking) lines.push(`│ ${this.theme.fg("warning", `${label} thinking...`)}`);
+
+			if (turn.reasoning.trim()) {
+				lines.push(...this.renderSection(`${turn.id}:reasoning`, `${label} reasoning`, turn.reasoning, width, false));
+			}
+
+			for (const tool of turn.toolUses) {
+				const bodyParts = [formatToolInput(tool.name, tool.input)];
+				const preview = tool.status === "error" ? tool.errorPreview : tool.resultPreview;
+				if (preview) bodyParts.push(preview);
+				lines.push(
+					...this.renderSection(
+						`${turn.id}:tool:${tool.id}`,
+						`${statusLabel(tool.status)} ${tool.name}`,
+						bodyParts.join("\n\n"),
+						width,
+						tool.status === "in-progress" || tool.status === "queued",
+						tool.status === "error" ? "error" : tool.status === "done" ? "success" : "warning",
+					),
+				);
+			}
+		});
+
+		if (details.status === "done") lines.push(`│ ${this.theme.fg("success", "Oracle finished.")}`);
+		return lines;
+	}
+
+	private renderSection(id: string, title: string, body: string, width: number, defaultOpen: boolean, color = "muted"): string[] {
+		const fullId = `${this.instanceId}:${id}`;
+		const open = this.sections.get(fullId) ?? defaultOpen;
+		const arrow = open ? "▾" : "▸";
+		const lines = [`│ ${clickable(fullId, () => this.toggleSection(fullId))}${arrow} ${this.theme.fg(color, title)}`];
+		if (!open) {
+			const preview = truncateOneLine(body, width - 4);
+			if (preview) lines.push(`│   ${this.theme.fg("dim", fitLine(preview, width - 4))}`);
+			return lines;
+		}
+
+		for (const line of simpleWrap(body, Math.max(20, width - 4)).slice(0, 80)) {
+			lines.push(`│   ${padRight(line, 0)}`);
+		}
+		const bodyLines = simpleWrap(body, Math.max(20, width - 4));
+		if (bodyLines.length > 80) lines.push(`│   ${this.theme.fg("dim", `... (${bodyLines.length - 80} more lines)`)}`);
+		return lines;
+	}
 }
 
 async function runOracle(
@@ -780,6 +928,8 @@ async function runOracle(
 }
 
 export default function oracleExtension(pi: ExtensionAPI) {
+	installClickableTraceRuntimePatch();
+
 	pi.registerTool({
 		name: "oracle",
 		label: "Oracle",
@@ -812,25 +962,21 @@ Do not use it for simple file reads/searches, codebase searches the main agent c
 				}),
 			),
 		}),
+		renderShell: "self",
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			return runOracle(params as OracleParams, ctx.cwd, signal, onUpdate);
 		},
-		renderCall(args, theme) {
-			const task = typeof args.task === "string" ? args.task : "";
-			const preview = task.length > 80 ? `${task.slice(0, 80)}...` : task;
-			return new Text(`${theme.fg("toolTitle", theme.bold("oracle"))} ${theme.fg("muted", preview)}`, 0, 0);
+		renderCall() {
+			return new Text("", 0, 0);
 		},
 		renderResult(result, { expanded, isPartial }, theme, context) {
 			const text = textFromResult(result);
 			const details = result.details as OracleDetails | undefined;
 			const params = context.args as OracleParams;
-			return new Text(
-				expanded
-					? renderOracleExpanded(params, details, text, isPartial, theme)
-					: renderOracleCollapsed(params, details, text, isPartial, theme),
-				0,
-				0,
-			);
+			const component =
+				context.lastComponent instanceof OracleTraceComponent ? context.lastComponent : new OracleTraceComponent();
+			component.update(params, details, text, isPartial, theme, context.invalidate, expanded);
+			return component;
 		},
 	});
 }
