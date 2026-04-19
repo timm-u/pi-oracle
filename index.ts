@@ -5,13 +5,13 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { keyHint, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 
 const ORACLE_MODEL = process.env.PI_ORACLE_MODEL || "openai-codex/gpt-5.4";
 const ORACLE_THINKING = process.env.PI_ORACLE_THINKING || "high";
-const ORACLE_TOOLS = process.env.PI_ORACLE_TOOLS || "read,grep,find,ls";
+const ORACLE_TOOLS = process.env.PI_ORACLE_TOOLS || "read,grep,find,ls,web_search,read_web_page,find_thread,read_thread";
 const WEB_TOOLS_EXTENSION = path.join(path.dirname(fileURLToPath(import.meta.url)), "web-tools.ts");
 
 const ORACLE_SYSTEM_PROMPT = `You are the Oracle - an expert AI advisor with advanced reasoning capabilities.
@@ -78,24 +78,39 @@ interface UsageStats {
 	turns: number;
 }
 
+type OracleRunStatus = "starting" | "in-progress" | "done" | "error" | "cancelled";
+type OracleToolStatus = "queued" | "in-progress" | "done" | "error" | "cancelled";
+
 interface OracleToolUse {
 	id: string;
 	name: string;
-	status: string;
+	status: OracleToolStatus;
 	input?: unknown;
+	resultPreview?: string;
+	errorPreview?: string;
+	startedAt?: number;
+	endedAt?: number;
+}
+
+interface OracleTranscriptTurn {
+	id: string;
+	message: string;
+	reasoning: string;
+	isThinking: boolean;
+	toolUses: OracleToolUse[];
 }
 
 interface OracleDetails {
+	status: OracleRunStatus;
 	model: string;
 	thinking: string;
 	cwd: string;
 	files: string[];
 	missingFiles: string[];
-	progress: string[];
-	currentMessage: string;
-	currentReasoning: string;
-	isThinking: boolean;
-	activeTools: OracleToolUse[];
+	transcript: OracleTranscriptTurn[];
+	currentTurnId?: string;
+	finalAnswer: string;
+	errorMessage?: string;
 	usage: UsageStats;
 	exitCode: number | null;
 }
@@ -198,27 +213,110 @@ function formatToolInput(toolName: string, input: unknown): string {
 	}
 }
 
-function pushProgress(details: OracleDetails, message: string) {
-	const previous = details.progress.at(-1);
-	if (previous !== message) details.progress.push(message);
-	if (details.progress.length > 80) details.progress = details.progress.slice(-80);
+function getCurrentTurn(details: OracleDetails): OracleTranscriptTurn {
+	const current = details.transcript.find((turn) => turn.id === details.currentTurnId);
+	if (current) return current;
+
+	const turn: OracleTranscriptTurn = {
+		id: `turn-${details.transcript.length + 1}`,
+		message: "",
+		reasoning: "",
+		isThinking: false,
+		toolUses: [],
+	};
+	details.transcript.push(turn);
+	details.currentTurnId = turn.id;
+	return turn;
+}
+
+function startTranscriptTurn(details: OracleDetails): OracleTranscriptTurn {
+	const turn: OracleTranscriptTurn = {
+		id: `turn-${details.transcript.length + 1}`,
+		message: "",
+		reasoning: "",
+		isThinking: true,
+		toolUses: [],
+	};
+	details.transcript.push(turn);
+	details.currentTurnId = turn.id;
+	return turn;
 }
 
 function upsertToolUse(details: OracleDetails, tool: OracleToolUse) {
-	const existingIndex = details.activeTools.findIndex((item) => item.id === tool.id);
+	const turn = getCurrentTurn(details);
+	const existingIndex = turn.toolUses.findIndex((item) => item.id === tool.id);
 	if (existingIndex >= 0) {
-		const existing = details.activeTools[existingIndex];
-		details.activeTools[existingIndex] = { ...existing, ...tool, input: tool.input ?? existing.input };
+		const existing = turn.toolUses[existingIndex];
+		turn.toolUses[existingIndex] = { ...existing, ...tool, input: tool.input ?? existing.input };
 	} else {
-		details.activeTools.push(tool);
+		turn.toolUses.push(tool);
 	}
-	if (details.activeTools.length > 20) details.activeTools = details.activeTools.slice(-20);
 }
 
-function buildOracleProgressBody(params: OracleParams, details: OracleDetails, finalText: string): string {
+function getAllToolUses(details: OracleDetails): OracleToolUse[] {
+	return details.transcript.flatMap((turn) => turn.toolUses);
+}
+
+function getActiveToolUses(details: OracleDetails): OracleToolUse[] {
+	return getAllToolUses(details).filter((tool) => tool.status === "queued" || tool.status === "in-progress");
+}
+
+function getLatestTurn(details: OracleDetails): OracleTranscriptTurn | undefined {
+	return details.transcript.at(-1);
+}
+
+function resultPreview(result: unknown, maxLength = 800): string | undefined {
+	if (!result || typeof result !== "object") return undefined;
+	const content = (result as { content?: Array<{ type: string; text?: string }> }).content;
+	if (!Array.isArray(content)) return undefined;
+	const text = content
+		.filter((part): part is { type: "text"; text: string } => part.type === "text" && typeof part.text === "string")
+		.map((part) => part.text)
+		.join("\n")
+		.trim();
+	return text ? truncateText(text, maxLength) : undefined;
+}
+
+function formatTokens(count: number): string {
+	if (!Number.isFinite(count) || count <= 0) return "";
+	if (count < 1000) return String(count);
+	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+	if (count < 1000000) return `${Math.round(count / 1000)}k`;
+	return `${(count / 1000000).toFixed(1)}M`;
+}
+
+function formatUsage(usage: UsageStats): string {
+	const parts: string[] = [];
+	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns === 1 ? "" : "s"}`);
+	if (usage.input) parts.push(`in ${formatTokens(usage.input)}`);
+	if (usage.output) parts.push(`out ${formatTokens(usage.output)}`);
+	if (usage.cacheRead) parts.push(`cache ${formatTokens(usage.cacheRead)}`);
+	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
+	return parts.join(" ");
+}
+
+function currentActivity(details: OracleDetails): string {
+	if (details.status === "starting") return "starting nested pi";
+	if (details.status === "done") return "finished";
+	if (details.status === "error") return "failed";
+	if (details.status === "cancelled") return "cancelled";
+
+	const active = getActiveToolUses(details).at(-1);
+	if (active) return `${active.status === "queued" ? "queued" : "using"} ${formatToolInput(active.name, active.input)}`;
+
+	const latest = getLatestTurn(details);
+	if (latest?.isThinking) return "thinking";
+	if (latest?.message.trim()) return "drafting answer";
+	return "working";
+}
+
+function buildOracleProgressBody(params: OracleParams, details: OracleDetails): string {
+	const activity = currentActivity(details);
+	const usage = formatUsage(details.usage);
 	const lines: string[] = [
-		`Oracle is consulting ${details.model} (${details.thinking} thinking)`,
+		`Oracle ${activity}`,
 		`Task: ${truncateOneLine(params.task, 180)}`,
+		`Model: ${details.model} (${details.thinking} thinking)${usage ? `, ${usage}` : ""}`,
 	];
 
 	if (details.files.length > 0) {
@@ -228,31 +326,9 @@ function buildOracleProgressBody(params: OracleParams, details: OracleDetails, f
 		lines.push(`Missing files: ${details.missingFiles.join(", ")}`);
 	}
 
-	const recentProgress = details.progress.slice(-10);
-	if (recentProgress.length > 0) {
-		lines.push("", "Progress:");
-		for (const item of recentProgress) lines.push(`- ${item}`);
-	}
-
-	const visibleActiveTools = details.activeTools.filter((tool) => tool.status !== "done").slice(-8);
-	if (visibleActiveTools.length > 0) {
-		lines.push("", "Active tools:");
-		for (const tool of visibleActiveTools) {
-			lines.push(`- ${tool.status} ${formatToolInput(tool.name, tool.input)}`);
-		}
-	}
-
-	if (details.currentReasoning.trim()) {
-		lines.push("", details.isThinking ? "Reasoning now:" : "Recent reasoning:");
-		lines.push(truncateText(details.currentReasoning, 1400));
-	}
-
-	const draft = finalText.trim() || details.currentMessage.trim();
-	if (draft) {
-		lines.push("", "Draft answer:");
-		lines.push(truncateText(draft, 2200));
-	}
-
+	const activeTools = getActiveToolUses(details);
+	if (activeTools.length > 0) lines.push(`Active: ${activeTools.map((tool) => formatToolInput(tool.name, tool.input)).join("; ")}`);
+	if (details.errorMessage) lines.push(`Error: ${truncateOneLine(details.errorMessage, 220)}`);
 	return lines.join("\n");
 }
 
@@ -280,6 +356,170 @@ function createPartialResult(text: string, details: OracleDetails): AgentToolRes
 	};
 }
 
+function textFromResult(result: { content: Array<{ type: string; text?: string }> }): string {
+	return result.content
+		.filter((part): part is { type: "text"; text: string } => part.type === "text" && typeof part.text === "string")
+		.map((part) => part.text)
+		.join("\n")
+		.trim();
+}
+
+function indentBlock(text: string, spaces = 2): string {
+	const prefix = " ".repeat(spaces);
+	return text
+		.replace(/\r\n/g, "\n")
+		.split("\n")
+		.map((line) => `${prefix}${line}`)
+		.join("\n");
+}
+
+function statusLabel(status: OracleToolStatus): string {
+	switch (status) {
+		case "queued":
+			return "queued";
+		case "in-progress":
+			return "running";
+		case "done":
+			return "done";
+		case "error":
+			return "error";
+		case "cancelled":
+			return "cancelled";
+	}
+}
+
+function renderToolUse(tool: OracleToolUse, theme: any, expanded: boolean): string {
+	const statusColor = tool.status === "error" ? "error" : tool.status === "done" ? "success" : "warning";
+	const lines = [
+		`${theme.fg("muted", "tool")} ${theme.fg("toolTitle", tool.name)} ${theme.fg(statusColor, statusLabel(tool.status))}`,
+		indentBlock(formatToolInput(tool.name, tool.input), 2),
+	];
+
+	const preview = tool.status === "error" ? tool.errorPreview : tool.resultPreview;
+	if (preview && expanded) {
+		lines.push(indentBlock(tool.status === "error" ? "Error:" : "Result:", 2));
+		lines.push(indentBlock(truncateText(preview, 1600), 4));
+	} else if (preview) {
+		lines.push(indentBlock(truncateOneLine(preview, 160), 2));
+	}
+
+	return lines.join("\n");
+}
+
+function renderOracleTrace(details: OracleDetails, theme: any, expanded: boolean): string {
+	const lines: string[] = [];
+	const turns = expanded ? details.transcript : details.transcript.slice(-1);
+	const skipped = details.transcript.length - turns.length;
+	if (skipped > 0) lines.push(theme.fg("muted", `... ${skipped} earlier Oracle step${skipped === 1 ? "" : "s"}`));
+
+	for (const turn of turns) {
+		const message = turn.message.trim();
+		const reasoning = turn.reasoning.trim();
+
+		if (message) {
+			lines.push(theme.fg("toolOutput", expanded ? message : truncateText(message, 700)));
+		} else if (turn.isThinking) {
+			lines.push(theme.fg("warning", "Oracle is thinking..."));
+		}
+
+		if (reasoning) {
+			lines.push("");
+			lines.push(theme.fg("muted", "Reasoning"));
+			lines.push(indentBlock(expanded ? reasoning : truncateText(reasoning, 700), 2));
+		} else if (turn.isThinking) {
+			lines.push(theme.fg("muted", "Reasoning stream has started; no text emitted yet."));
+		}
+
+		for (const tool of turn.toolUses) {
+			lines.push("");
+			lines.push(renderToolUse(tool, theme, expanded));
+		}
+	}
+
+	return lines.join("\n").trim();
+}
+
+function renderOracleCollapsed(
+	args: OracleParams,
+	details: OracleDetails | undefined,
+	outputText: string,
+	isPartial: boolean,
+	theme: any,
+): string {
+	if (!details) return outputText || "Oracle answered";
+
+	const activity = currentActivity(details);
+	const usage = formatUsage(details.usage);
+	const lines = [
+		`${theme.fg("toolTitle", theme.bold("oracle"))} ${theme.fg(details.status === "error" ? "error" : isPartial ? "warning" : "success", activity)}`,
+		theme.fg("muted", truncateOneLine(args.task ?? "", 180)),
+	];
+
+	const activeTools = getActiveToolUses(details);
+	if (activeTools.length > 0) {
+		lines.push(theme.fg("muted", "Current tools:"));
+		for (const tool of activeTools.slice(-4)) lines.push(`  ${statusLabel(tool.status)} ${formatToolInput(tool.name, tool.input)}`);
+	}
+
+	const finalText = (details.finalAnswer || outputText).trim();
+	const latestTrace = renderOracleTrace(details, theme, false);
+	const preview = finalText || latestTrace;
+	if (preview) {
+		lines.push("");
+		lines.push(truncateText(preview, isPartial ? 900 : 1400));
+	}
+
+	const footerParts = [];
+	if (usage) footerParts.push(usage);
+	footerParts.push(keyHint("app.tools.expand", "to inspect Oracle trace"));
+	lines.push("");
+	lines.push(theme.fg("dim", footerParts.join(" | ")));
+	return lines.join("\n");
+}
+
+function renderOracleExpanded(
+	args: OracleParams,
+	details: OracleDetails | undefined,
+	outputText: string,
+	isPartial: boolean,
+	theme: any,
+): string {
+	if (!details) return outputText || "Oracle answered";
+
+	const usage = formatUsage(details.usage);
+	const lines = [
+		`${theme.fg("toolTitle", theme.bold("oracle"))} ${theme.fg(details.status === "error" ? "error" : isPartial ? "warning" : "success", currentActivity(details))}`,
+		`${theme.fg("muted", "Task:")} ${theme.fg("dim", args.task ?? "")}`,
+		`${theme.fg("muted", "Model:")} ${theme.fg("dim", `${details.model} (${details.thinking} thinking)`)}`,
+	];
+
+	if (details.files.length > 0) lines.push(`${theme.fg("muted", "Files:")} ${details.files.map((file) => path.basename(file)).join(", ")}`);
+	if (details.missingFiles.length > 0) lines.push(`${theme.fg("warning", "Missing files:")} ${details.missingFiles.join(", ")}`);
+	if (usage) lines.push(theme.fg("dim", usage));
+	if (details.errorMessage) lines.push(theme.fg("error", details.errorMessage));
+
+	const finalText = (details.finalAnswer || (!isPartial ? outputText : "")).trim();
+	if (finalText) {
+		lines.push("");
+		lines.push(theme.fg("muted", "--- Oracle answer ---"));
+		lines.push(theme.fg("toolOutput", finalText));
+	}
+
+	const trace = renderOracleTrace(details, theme, true);
+	if (trace) {
+		lines.push("");
+		lines.push(theme.fg("muted", "--- Oracle trace ---"));
+		lines.push(trace);
+	}
+
+	if (details.status === "done") {
+		lines.push("");
+		lines.push(theme.fg("success", "Oracle finished."));
+	}
+
+	return lines.join("\n");
+}
+
 async function runOracle(
 	params: OracleParams,
 	cwd: string,
@@ -298,16 +538,14 @@ async function runOracle(
 	}
 
 	const details: OracleDetails = {
+		status: "starting",
 		model: ORACLE_MODEL,
 		thinking: ORACLE_THINKING,
 		cwd,
 		files: existingFiles,
 		missingFiles,
-		progress: [],
-		currentMessage: "",
-		currentReasoning: "",
-		isThinking: false,
-		activeTools: [],
+		transcript: [],
+		finalAnswer: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, turns: 0 },
 		exitCode: null,
 	};
@@ -357,11 +595,10 @@ async function runOracle(
 			const now = Date.now();
 			if (!force && now - lastUpdateAt < 250) return;
 			lastUpdateAt = now;
-			const body = buildOracleProgressBody(params, details, finalText);
+			const body = buildOracleProgressBody(params, details);
 			onUpdate?.(createPartialResult(body, details));
 		};
 
-		pushProgress(details, `started nested pi: ${ORACLE_MODEL} with ${ORACLE_THINKING} thinking`);
 		emitUpdate(true);
 
 		const handleLine = (line: string) => {
@@ -374,77 +611,113 @@ async function runOracle(
 			}
 
 			if (event.type === "agent_start") {
-				pushProgress(details, "agent started");
+				details.status = "in-progress";
 				emitUpdate(true);
 			} else if (event.type === "turn_start") {
-				pushProgress(details, `turn ${details.usage.turns + 1} started`);
-				details.currentMessage = "";
-				details.currentReasoning = "";
-				details.isThinking = true;
+				startTranscriptTurn(details);
 				emitUpdate(true);
 			} else if (event.type === "tool_execution_start") {
-				const id = String(event.toolCallId ?? `${event.toolName}-${details.progress.length}`);
-				upsertToolUse(details, { id, name: event.toolName, status: "in-progress", input: event.args });
-				pushProgress(details, `using ${formatToolInput(event.toolName, event.args)}`);
+				const id = String(event.toolCallId ?? `${event.toolName}-${getAllToolUses(details).length}`);
+				upsertToolUse(details, {
+					id,
+					name: String(event.toolName ?? "tool"),
+					status: "in-progress",
+					input: event.args,
+					startedAt: Date.now(),
+				});
 				emitUpdate(true);
 			} else if (event.type === "tool_execution_update") {
-				const id = String(event.toolCallId ?? `${event.toolName}-${details.progress.length}`);
-				upsertToolUse(details, { id, name: event.toolName, status: "in-progress", input: event.args });
+				const id = String(event.toolCallId ?? `${event.toolName}-${getAllToolUses(details).length}`);
+				upsertToolUse(details, {
+					id,
+					name: String(event.toolName ?? "tool"),
+					status: "in-progress",
+					input: event.args,
+					resultPreview: resultPreview(event.partialResult, 400),
+				});
 				emitUpdate();
 			} else if (event.type === "tool_execution_end") {
-				const id = String(event.toolCallId ?? `${event.toolName}-${details.progress.length}`);
-				const status = event.isError ? "error" : "done";
-				const existingTool = details.activeTools.find((tool) => tool.id === id);
+				const id = String(event.toolCallId ?? `${event.toolName}-${getAllToolUses(details).length}`);
+				const status: OracleToolStatus = event.isError ? "error" : "done";
+				const existingTool = getAllToolUses(details).find((tool) => tool.id === id);
 				const input = event.args ?? existingTool?.input;
-				upsertToolUse(details, { id, name: event.toolName, status, input });
-				pushProgress(details, `${event.isError ? "failed" : "finished"} ${formatToolInput(event.toolName, input)}`);
+				const preview = resultPreview(event.result);
+				upsertToolUse(details, {
+					id,
+					name: String(event.toolName ?? existingTool?.name ?? "tool"),
+					status,
+					input,
+					resultPreview: event.isError ? existingTool?.resultPreview : preview,
+					errorPreview: event.isError ? preview : existingTool?.errorPreview,
+					endedAt: Date.now(),
+				});
 				emitUpdate(true);
 			} else if (event.type === "message_update") {
 				const messageEvent = event.assistantMessageEvent;
 				if (messageEvent?.type === "thinking_start") {
-					details.currentReasoning = "";
-					details.isThinking = true;
-					pushProgress(details, "reasoning started");
+					const turn = getCurrentTurn(details);
+					turn.reasoning = "";
+					turn.isThinking = true;
 					emitUpdate(true);
 				} else if (messageEvent?.type === "thinking_delta") {
-					details.currentReasoning += messageEvent.delta ?? "";
-					details.isThinking = true;
+					const turn = getCurrentTurn(details);
+					turn.reasoning += messageEvent.delta ?? "";
+					turn.isThinking = true;
 					emitUpdate();
 				} else if (messageEvent?.type === "thinking_end") {
-					details.currentReasoning = messageEvent.content ?? details.currentReasoning;
-					details.isThinking = false;
-					pushProgress(details, "reasoning finished");
+					const turn = getCurrentTurn(details);
+					turn.reasoning = messageEvent.content ?? turn.reasoning;
+					turn.isThinking = false;
 					emitUpdate(true);
 				} else if (messageEvent?.type === "text_start") {
-					pushProgress(details, "drafting answer");
 					emitUpdate(true);
 				} else if (messageEvent?.type === "text_delta") {
-					finalText += messageEvent.delta ?? "";
-					details.currentMessage = finalText;
-					details.isThinking = false;
+					const turn = getCurrentTurn(details);
+					turn.message += messageEvent.delta ?? "";
+					turn.isThinking = false;
+					finalText = turn.message;
 					emitUpdate();
+				} else if (messageEvent?.type === "text_end") {
+					const turn = getCurrentTurn(details);
+					turn.message = messageEvent.content ?? turn.message;
+					turn.isThinking = false;
+					finalText = turn.message;
+					emitUpdate(true);
 				} else if (messageEvent?.type === "toolcall_start") {
-					pushProgress(details, "preparing tool call");
 					emitUpdate(true);
 				} else if (messageEvent?.type === "toolcall_end") {
 					const toolCall = messageEvent.toolCall;
 					if (toolCall?.id && toolCall.name) {
 						upsertToolUse(details, { id: toolCall.id, name: toolCall.name, status: "queued", input: toolCall.arguments });
-						pushProgress(details, `queued ${formatToolInput(toolCall.name, toolCall.arguments)}`);
 						emitUpdate(true);
 					}
+				} else if (messageEvent?.type === "done") {
+					const text = textFromMessage(messageEvent.message);
+					if (text) {
+						const turn = getCurrentTurn(details);
+						turn.message = text;
+						finalText = text;
+					}
+					emitUpdate(true);
+				} else if (messageEvent?.type === "error") {
+					details.status = "error";
+					details.errorMessage = messageEvent.error?.errorMessage ?? "Oracle model stream failed";
+					emitUpdate(true);
 				}
 			} else if (event.type === "message_end" && event.message?.role === "assistant") {
 				const text = textFromMessage(event.message);
-				if (text) finalText = text;
-				details.currentMessage = finalText;
-				details.isThinking = false;
+				if (text) {
+					const turn = getCurrentTurn(details);
+					turn.message = text;
+					turn.isThinking = false;
+					finalText = text;
+				}
 				accumulateUsage(details.usage, event.message);
 				emitUpdate(true);
 			} else if (event.type === "turn_end") {
 				details.usage.turns++;
-				pushProgress(details, `turn ${details.usage.turns} finished`);
-				details.isThinking = false;
+				const turn = getCurrentTurn(details);
+				turn.isThinking = false;
 				emitUpdate(true);
 			} else if (event.type === "agent_end") {
 				sawAgentEnd = true;
@@ -452,9 +725,10 @@ async function runOracle(
 				const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant");
 				const text = textFromMessage(lastAssistant);
 				if (text) finalText = text;
-				details.currentMessage = finalText;
-				details.isThinking = false;
-				pushProgress(details, "agent finished");
+				details.finalAnswer = finalText;
+				details.status = "done";
+				const turn = getCurrentTurn(details);
+				turn.isThinking = false;
 				emitUpdate(true);
 			}
 		};
@@ -485,16 +759,22 @@ async function runOracle(
 			if (stdoutBuffer.trim()) handleLine(stdoutBuffer);
 
 			if (code !== 0) {
-				reject(new Error(stderr.trim() || `Oracle process exited with code ${code}`));
+				details.status = "error";
+				details.errorMessage = stderr.trim() || `Oracle process exited with code ${code}`;
+				reject(new Error(details.errorMessage));
 				return;
 			}
 
 			if (!sawAgentEnd && !finalText) {
-				reject(new Error(stderr.trim() || "Oracle process ended without a final answer"));
+				details.status = "error";
+				details.errorMessage = stderr.trim() || "Oracle process ended without a final answer";
+				reject(new Error(details.errorMessage));
 				return;
 			}
 
-			resolve(createPartialResult(finalText.trim() || "(Oracle returned no text.)", details));
+			details.status = "done";
+			details.finalAnswer = finalText.trim() || "(Oracle returned no text.)";
+			resolve(createPartialResult(details.finalAnswer, details));
 		});
 	});
 }
@@ -540,27 +820,17 @@ Do not use it for simple file reads/searches, codebase searches the main agent c
 			const preview = task.length > 80 ? `${task.slice(0, 80)}...` : task;
 			return new Text(`${theme.fg("toolTitle", theme.bold("oracle"))} ${theme.fg("muted", preview)}`, 0, 0);
 		},
-		renderResult(result, { expanded }, theme) {
-			const text = result.content.find((part) => part.type === "text")?.text ?? "";
-			if (expanded) return new Text(text, 0, 0);
-
-			const firstLine = text
-				.split("\n")
-				.map((line) => line.trim())
-				.find(Boolean);
-			const summary = firstLine && firstLine.length > 160 ? `${firstLine.slice(0, 160)}...` : firstLine;
+		renderResult(result, { expanded, isPartial }, theme, context) {
+			const text = textFromResult(result);
 			const details = result.details as OracleDetails | undefined;
-			const usage = details?.usage;
-			const suffix = usage?.cost ? theme.fg("dim", ` ($${usage.cost.toFixed(4)})`) : "";
-			const textWithUsage = text.trim()
-				? `${text.trim()}${suffix ? `\n\n${suffix}` : ""}`
-				: theme.fg("success", "Oracle answered") + suffix;
-
-			if (expanded && details?.progress?.length) {
-				return new Text(`${textWithUsage}\n\n${theme.fg("dim", "Oracle progress:")}\n${details.progress.map((line) => theme.fg("dim", `- ${line}`)).join("\n")}`, 0, 0);
-			}
-
-			return new Text(textWithUsage || summary || "Oracle answered", 0, 0);
+			const params = context.args as OracleParams;
+			return new Text(
+				expanded
+					? renderOracleExpanded(params, details, text, isPartial, theme)
+					: renderOracleCollapsed(params, details, text, isPartial, theme),
+				0,
+				0,
+			);
 		},
 	});
 }

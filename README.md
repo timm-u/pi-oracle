@@ -6,7 +6,7 @@ It adds an `oracle` tool that the main agent can call when it wants a second, hi
 
 The Oracle runs in an isolated nested `pi --mode json --no-session` process. It is advisory only: it can read/search local files and consult the web, but it does not edit files or run shell commands.
 
-While the nested Oracle is running, the tool streams a live progress view with the current turn, recent reasoning when the model exposes it, queued/running tool calls, and draft answer text. The final result is shown directly in the tool output rather than collapsed to a one-line summary.
+While the nested Oracle is running, the tool streams a live trace instead of leaving you staring at a black-box `Working...` state. The collapsed view stays compact, while expanding the Oracle tool row shows the Oracle's streamed answer text, reasoning when the model exposes it, queued/running tool calls, completed tool results, and tool errors in order. Completed or failed tools are kept in the trace instead of being mislabeled as active work.
 
 ## Inspiration and Good-Faith Note
 
@@ -100,6 +100,20 @@ The main agent can also call the tool directly:
 }
 ```
 
+## Live Oracle Trace
+
+When Oracle starts, pi shows a compact live status line with the current activity, active queued/running tools, token/cost details when available, and a preview of the answer or latest trace.
+
+Expand the Oracle tool row with pi's normal tool-expand keybinding to inspect the full trace:
+
+- streamed Oracle answer text
+- reasoning blocks, when the nested model/provider emits reasoning text
+- tool call blocks for `read`, `grep`, `find`, `ls`, web search, web page reads, and thread lookups
+- completed tool result previews and failed tool errors in their original order
+- the final Oracle answer once the nested run finishes
+
+If the nested model does not expose reasoning text, the trace still shows that Oracle is thinking and continues to stream message and tool activity as it becomes available.
+
 ## What the Oracle Can Do
 
 - Read specific files you pass to it
@@ -139,7 +153,7 @@ Available settings:
 | --- | --- | --- |
 | `PI_ORACLE_MODEL` | `openai-codex/gpt-5.4` | Nested pi model used by the Oracle |
 | `PI_ORACLE_THINKING` | `high` | Nested pi thinking level |
-| `PI_ORACLE_TOOLS` | `read,grep,find,ls` | Read-only tools available to the Oracle |
+| `PI_ORACLE_TOOLS` | `read,grep,find,ls,web_search,read_web_page,find_thread,read_thread` | Read-only tools available to the Oracle |
 | `PI_ORACLE_WEB_BACKEND` | `auto` | `auto`, `codex`, or `duckduckgo` |
 | `PI_ORACLE_CODEX_SEARCH_MODEL` | `gpt-5.4-mini` | Model used by Codex CLI web search |
 | `PI_ORACLE_CODEX_SEARCH_TIMEOUT_MS` | `120000` | Codex CLI web search timeout |
