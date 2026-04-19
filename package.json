@@ -1,0 +1,52 @@
+{
+  "name": "pi-oracle",
+  "version": "0.1.0",
+  "description": "Oracle advisor tool extension for pi coding agent",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "files": [
+    "index.ts",
+    "web-tools.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "oracle",
+    "subagent",
+    "code-review",
+    "architecture",
+    "ai"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/timm-u/pi-oracle.git"
+  },
+  "homepage": "https://github.com/timm-u/pi-oracle",
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-agent-core": "^0.67.68",
+    "@mariozechner/pi-ai": "^0.67.68",
+    "@mariozechner/pi-coding-agent": "^0.67.68",
+    "@mariozechner/pi-tui": "^0.67.68",
+    "@sinclair/typebox": "^0.34.44",
+    "@types/node": "^24.3.0",
+    "typescript": "^5.7.3"
+  }
+}
