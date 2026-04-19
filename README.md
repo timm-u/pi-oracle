@@ -6,6 +6,14 @@ It adds an `oracle` tool that the main agent can call when it wants a second, hi
 
 The Oracle runs in an isolated nested `pi --mode json --no-session` process. It is advisory only: it can read/search local files and consult the web, but it does not edit files or run shell commands.
 
+## Inspiration and Good-Faith Note
+
+This extension is heavily inspired by the Oracle feature in Amp CLI. I personally really like how that workflow feels: you can ask for a deeper second opinion, get architecture feedback, sanity-check plans, or have a harder problem reviewed by a more focused advisor.
+
+`pi-oracle` is a passion project that tries to bring a similar style of functionality to pi-coding-agent and, hopefully, make that kind of workflow useful outside of Amp CLI too. It is not affiliated with Amp or its maintainers, and it is not meant to impersonate, compete with, or cause trouble for anyone. It was built in good faith because I found the idea genuinely useful and wanted to use it with my own tools.
+
+If any Amp developer or maintainer feels this public repo is problematic, please reach out. I am happy to talk, adjust wording or implementation details, or make the repo private if that is the right thing to do. No drama intended, just appreciation for a good idea and a small open-source experiment around it.
+
 ## Prerequisites
 
 - pi `0.67.68` or newer
