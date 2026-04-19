@@ -6,6 +6,8 @@ It adds an `oracle` tool that the main agent can call when it wants a second, hi
 
 The Oracle runs in an isolated nested `pi --mode json --no-session` process. It is advisory only: it can read/search local files and consult the web, but it does not edit files or run shell commands.
 
+While the nested Oracle is running, the tool streams a live progress view with the current turn, recent reasoning when the model exposes it, queued/running tool calls, and draft answer text. The final result is shown directly in the tool output rather than collapsed to a one-line summary.
+
 ## Inspiration and Good-Faith Note
 
 This extension is heavily inspired by the Oracle feature in Amp CLI. I personally really like how that workflow feels: you can ask for a deeper second opinion, get architecture feedback, sanity-check plans, or have a harder problem reviewed by a more focused advisor.

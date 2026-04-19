@@ -78,6 +78,13 @@ interface UsageStats {
 	turns: number;
 }
 
+interface OracleToolUse {
+	id: string;
+	name: string;
+	status: string;
+	input?: unknown;
+}
+
 interface OracleDetails {
 	model: string;
 	thinking: string;
@@ -85,6 +92,10 @@ interface OracleDetails {
 	files: string[];
 	missingFiles: string[];
 	progress: string[];
+	currentMessage: string;
+	currentReasoning: string;
+	isThinking: boolean;
+	activeTools: OracleToolUse[];
 	usage: UsageStats;
 	exitCode: number | null;
 }
@@ -140,6 +151,111 @@ function accumulateUsage(usage: UsageStats, message: Message) {
 	usage.cost += Number(anyUsage.cost?.total ?? anyUsage.cost ?? 0);
 }
 
+function truncateText(text: string, maxLength: number): string {
+	const normalized = text.replace(/\r\n/g, "\n").trim();
+	if (normalized.length <= maxLength) return normalized;
+	return `${normalized.slice(0, maxLength).trimEnd()}\n... (${normalized.length - maxLength} more chars)`;
+}
+
+function truncateOneLine(text: string, maxLength: number): string {
+	const normalized = text.replace(/\s+/g, " ").trim();
+	if (normalized.length <= maxLength) return normalized;
+	return `${normalized.slice(0, maxLength - 3).trimEnd()}...`;
+}
+
+function formatToolInput(toolName: string, input: unknown): string {
+	if (!input || typeof input !== "object") return toolName;
+	const args = input as Record<string, unknown>;
+	switch (toolName) {
+		case "read":
+		case "Read":
+			return typeof args.path === "string" ? `${toolName}(${args.path})` : toolName;
+		case "grep":
+		case "Grep": {
+			const pattern = typeof args.pattern === "string" ? `"${truncateOneLine(args.pattern, 80)}"` : "";
+			const pathText = typeof args.path === "string" ? ` in ${args.path}` : "";
+			return pattern ? `${toolName}(${pattern}${pathText})` : toolName;
+		}
+		case "find":
+		case "glob": {
+			const pattern = typeof args.pattern === "string" ? args.pattern : typeof args.filePattern === "string" ? args.filePattern : "";
+			return pattern ? `${toolName}("${truncateOneLine(pattern, 100)}")` : toolName;
+		}
+		case "ls":
+			return typeof args.path === "string" ? `${toolName}(${args.path})` : toolName;
+		case "web_search":
+			return typeof args.query === "string" ? `${toolName}("${truncateOneLine(args.query, 100)}")` : toolName;
+		case "read_web_page":
+			return typeof args.url === "string" ? `${toolName}(${truncateOneLine(args.url, 120)})` : toolName;
+		case "find_thread":
+			return typeof args.query === "string" ? `${toolName}("${truncateOneLine(args.query, 100)}")` : toolName;
+		case "read_thread":
+			return typeof args.thread === "string" ? `${toolName}(${truncateOneLine(args.thread, 120)})` : toolName;
+		default: {
+			const json = JSON.stringify(input);
+			return json && json !== "{}" ? `${toolName} ${truncateOneLine(json, 140)}` : toolName;
+		}
+	}
+}
+
+function pushProgress(details: OracleDetails, message: string) {
+	const previous = details.progress.at(-1);
+	if (previous !== message) details.progress.push(message);
+	if (details.progress.length > 80) details.progress = details.progress.slice(-80);
+}
+
+function upsertToolUse(details: OracleDetails, tool: OracleToolUse) {
+	const existingIndex = details.activeTools.findIndex((item) => item.id === tool.id);
+	if (existingIndex >= 0) {
+		const existing = details.activeTools[existingIndex];
+		details.activeTools[existingIndex] = { ...existing, ...tool, input: tool.input ?? existing.input };
+	} else {
+		details.activeTools.push(tool);
+	}
+	if (details.activeTools.length > 20) details.activeTools = details.activeTools.slice(-20);
+}
+
+function buildOracleProgressBody(params: OracleParams, details: OracleDetails, finalText: string): string {
+	const lines: string[] = [
+		`Oracle is consulting ${details.model} (${details.thinking} thinking)`,
+		`Task: ${truncateOneLine(params.task, 180)}`,
+	];
+
+	if (details.files.length > 0) {
+		lines.push(`Files: ${details.files.map((file) => path.basename(file)).join(", ")}`);
+	}
+	if (details.missingFiles.length > 0) {
+		lines.push(`Missing files: ${details.missingFiles.join(", ")}`);
+	}
+
+	const recentProgress = details.progress.slice(-10);
+	if (recentProgress.length > 0) {
+		lines.push("", "Progress:");
+		for (const item of recentProgress) lines.push(`- ${item}`);
+	}
+
+	const visibleActiveTools = details.activeTools.filter((tool) => tool.status !== "done").slice(-8);
+	if (visibleActiveTools.length > 0) {
+		lines.push("", "Active tools:");
+		for (const tool of visibleActiveTools) {
+			lines.push(`- ${tool.status} ${formatToolInput(tool.name, tool.input)}`);
+		}
+	}
+
+	if (details.currentReasoning.trim()) {
+		lines.push("", details.isThinking ? "Reasoning now:" : "Recent reasoning:");
+		lines.push(truncateText(details.currentReasoning, 1400));
+	}
+
+	const draft = finalText.trim() || details.currentMessage.trim();
+	if (draft) {
+		lines.push("", "Draft answer:");
+		lines.push(truncateText(draft, 2200));
+	}
+
+	return lines.join("\n");
+}
+
 function buildOraclePrompt(params: OracleParams, existingFiles: string[], missingFiles: string[]): string {
 	const sections = [`## Task\n${params.task.trim()}`];
 	if (params.context?.trim()) {
@@ -188,6 +304,10 @@ async function runOracle(
 		files: existingFiles,
 		missingFiles,
 		progress: [],
+		currentMessage: "",
+		currentReasoning: "",
+		isThinking: false,
+		activeTools: [],
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, turns: 0 },
 		exitCode: null,
 	};
@@ -217,6 +337,7 @@ async function runOracle(
 	let stderr = "";
 	let finalText = "";
 	let sawAgentEnd = false;
+	let lastUpdateAt = 0;
 
 	return await new Promise<AgentToolResult<OracleDetails>>((resolve, reject) => {
 		const child = spawn(invocation.command, invocation.args, {
@@ -232,13 +353,16 @@ async function runOracle(
 		if (runSignal.aborted) return abort();
 		runSignal.addEventListener("abort", abort, { once: true });
 
-		const emitUpdate = () => {
-			const progress = details.progress.slice(-6).join("\n");
-			const body = finalText
-				? `Oracle is working...\n\n${finalText.slice(-3000)}`
-				: `Oracle is working...\n${progress ? `\n${progress}` : ""}`;
+		const emitUpdate = (force = false) => {
+			const now = Date.now();
+			if (!force && now - lastUpdateAt < 250) return;
+			lastUpdateAt = now;
+			const body = buildOracleProgressBody(params, details, finalText);
 			onUpdate?.(createPartialResult(body, details));
 		};
+
+		pushProgress(details, `started nested pi: ${ORACLE_MODEL} with ${ORACLE_THINKING} thinking`);
+		emitUpdate(true);
 
 		const handleLine = (line: string) => {
 			if (!line.trim()) return;
@@ -249,28 +373,89 @@ async function runOracle(
 				return;
 			}
 
-			if (event.type === "tool_execution_start") {
-				const argsText = JSON.stringify(event.args ?? {});
-				details.progress.push(`started ${event.toolName} ${argsText.length > 160 ? `${argsText.slice(0, 160)}...` : argsText}`);
+			if (event.type === "agent_start") {
+				pushProgress(details, "agent started");
+				emitUpdate(true);
+			} else if (event.type === "turn_start") {
+				pushProgress(details, `turn ${details.usage.turns + 1} started`);
+				details.currentMessage = "";
+				details.currentReasoning = "";
+				details.isThinking = true;
+				emitUpdate(true);
+			} else if (event.type === "tool_execution_start") {
+				const id = String(event.toolCallId ?? `${event.toolName}-${details.progress.length}`);
+				upsertToolUse(details, { id, name: event.toolName, status: "in-progress", input: event.args });
+				pushProgress(details, `using ${formatToolInput(event.toolName, event.args)}`);
+				emitUpdate(true);
+			} else if (event.type === "tool_execution_update") {
+				const id = String(event.toolCallId ?? `${event.toolName}-${details.progress.length}`);
+				upsertToolUse(details, { id, name: event.toolName, status: "in-progress", input: event.args });
 				emitUpdate();
 			} else if (event.type === "tool_execution_end") {
-				details.progress.push(`${event.isError ? "failed" : "finished"} ${event.toolName}`);
-				emitUpdate();
-			} else if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
-				finalText += event.assistantMessageEvent.delta ?? "";
-				emitUpdate();
+				const id = String(event.toolCallId ?? `${event.toolName}-${details.progress.length}`);
+				const status = event.isError ? "error" : "done";
+				const existingTool = details.activeTools.find((tool) => tool.id === id);
+				const input = event.args ?? existingTool?.input;
+				upsertToolUse(details, { id, name: event.toolName, status, input });
+				pushProgress(details, `${event.isError ? "failed" : "finished"} ${formatToolInput(event.toolName, input)}`);
+				emitUpdate(true);
+			} else if (event.type === "message_update") {
+				const messageEvent = event.assistantMessageEvent;
+				if (messageEvent?.type === "thinking_start") {
+					details.currentReasoning = "";
+					details.isThinking = true;
+					pushProgress(details, "reasoning started");
+					emitUpdate(true);
+				} else if (messageEvent?.type === "thinking_delta") {
+					details.currentReasoning += messageEvent.delta ?? "";
+					details.isThinking = true;
+					emitUpdate();
+				} else if (messageEvent?.type === "thinking_end") {
+					details.currentReasoning = messageEvent.content ?? details.currentReasoning;
+					details.isThinking = false;
+					pushProgress(details, "reasoning finished");
+					emitUpdate(true);
+				} else if (messageEvent?.type === "text_start") {
+					pushProgress(details, "drafting answer");
+					emitUpdate(true);
+				} else if (messageEvent?.type === "text_delta") {
+					finalText += messageEvent.delta ?? "";
+					details.currentMessage = finalText;
+					details.isThinking = false;
+					emitUpdate();
+				} else if (messageEvent?.type === "toolcall_start") {
+					pushProgress(details, "preparing tool call");
+					emitUpdate(true);
+				} else if (messageEvent?.type === "toolcall_end") {
+					const toolCall = messageEvent.toolCall;
+					if (toolCall?.id && toolCall.name) {
+						upsertToolUse(details, { id: toolCall.id, name: toolCall.name, status: "queued", input: toolCall.arguments });
+						pushProgress(details, `queued ${formatToolInput(toolCall.name, toolCall.arguments)}`);
+						emitUpdate(true);
+					}
+				}
 			} else if (event.type === "message_end" && event.message?.role === "assistant") {
 				const text = textFromMessage(event.message);
 				if (text) finalText = text;
+				details.currentMessage = finalText;
+				details.isThinking = false;
 				accumulateUsage(details.usage, event.message);
+				emitUpdate(true);
 			} else if (event.type === "turn_end") {
 				details.usage.turns++;
+				pushProgress(details, `turn ${details.usage.turns} finished`);
+				details.isThinking = false;
+				emitUpdate(true);
 			} else if (event.type === "agent_end") {
 				sawAgentEnd = true;
 				const messages = Array.isArray(event.messages) ? event.messages : [];
 				const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant");
 				const text = textFromMessage(lastAssistant);
 				if (text) finalText = text;
+				details.currentMessage = finalText;
+				details.isThinking = false;
+				pushProgress(details, "agent finished");
+				emitUpdate(true);
 			}
 		};
 
@@ -367,7 +552,15 @@ Do not use it for simple file reads/searches, codebase searches the main agent c
 			const details = result.details as OracleDetails | undefined;
 			const usage = details?.usage;
 			const suffix = usage?.cost ? theme.fg("dim", ` ($${usage.cost.toFixed(4)})`) : "";
-			return new Text(theme.fg("success", summary || "Oracle answered") + suffix, 0, 0);
+			const textWithUsage = text.trim()
+				? `${text.trim()}${suffix ? `\n\n${suffix}` : ""}`
+				: theme.fg("success", "Oracle answered") + suffix;
+
+			if (expanded && details?.progress?.length) {
+				return new Text(`${textWithUsage}\n\n${theme.fg("dim", "Oracle progress:")}\n${details.progress.map((line) => theme.fg("dim", `- ${line}`)).join("\n")}`, 0, 0);
+			}
+
+			return new Text(textWithUsage || summary || "Oracle answered", 0, 0);
 		},
 	});
 }
