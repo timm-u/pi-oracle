@@ -409,6 +409,66 @@ function currentActivity(details: OracleDetails): string {
 	return "working";
 }
 
+const ORACLE_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+function header(title: string, width: number): string {
+	const left = `╭─ ${title} `;
+	const right = "╮";
+	const fill = "─".repeat(Math.max(1, width - left.length - right.length));
+	return `${left}${fill}${right}`;
+}
+
+function footer(width: number): string {
+	return `╰${"─".repeat(width - 2)}╯`;
+}
+
+function line(content: string, width: number): string {
+	const innerWidth = width - 4;
+	const clipped = content.length > innerWidth ? content.slice(0, innerWidth - 1) + "…" : content;
+	const padded = clipped.padEnd(innerWidth);
+	return `│ ${padded} │`;
+}
+
+function section(title: string, width: number): string {
+	const label = `├─ ${title} `;
+	const right = "┤";
+	const fill = "─".repeat(Math.max(1, width - label.length - right.length));
+	return `${label}${fill}${right}`;
+}
+
+function lineKV(label: string, value: string, width: number): string {
+	const labelWidth = 8;
+	const innerWidth = width - 4;
+	const valueWidth = innerWidth - labelWidth - 1;
+	const clippedValue = value.length > valueWidth ? value.slice(0, valueWidth - 1) + "…" : value;
+	const paddedLabel = label.padEnd(labelWidth);
+	const paddedValue = clippedValue.padEnd(valueWidth);
+	return `│ ${paddedLabel} ${paddedValue} │`;
+}
+
+function lineRight(content: string, width: number): string {
+	const innerWidth = width - 4;
+	const padded = content.padStart(innerWidth);
+	return `│ ${padded} │`;
+}
+
+function wrapBoxText(text: string, width: number): string[] {
+	const innerWidth = width - 4;
+	const words = text.split(/\s+/);
+	const lines: string[] = [];
+	let currentLine = "";
+	for (const word of words) {
+		if (currentLine.length + word.length + 1 <= innerWidth) {
+			currentLine += (currentLine ? " " : "") + word;
+		} else {
+			if (currentLine) lines.push(currentLine);
+			currentLine = word.length > innerWidth ? word.slice(0, innerWidth - 1) + "…" : word;
+		}
+	}
+	if (currentLine) lines.push(currentLine);
+	return lines.map((l) => line(l, width));
+}
+
 function buildOracleProgressBody(params: OracleParams, details: OracleDetails): string {
 	const activity = currentActivity(details);
 	const usage = formatUsage(details.usage);
@@ -466,8 +526,94 @@ function textFromResult(result: { content: Array<{ type: string; text?: string }
 function statusGlyph(details: OracleDetails): string {
 	if (details.status === "done") return "✓";
 	if (details.status === "error") return "✗";
-	const frames = ["◐", "◓", "◑", "◒"];
-	return frames[Math.floor(Date.now() / 250) % frames.length] ?? "◐";
+	if (details.status === "cancelled") return "■";
+	if (details.status === "starting") return "·";
+	return ORACLE_SPINNER[Math.floor(Date.now() / 90) % ORACLE_SPINNER.length] ?? "⠋";
+}
+
+function statusLabel(details: OracleDetails): string {
+	if (details.status === "done") return "finished";
+	if (details.status === "error") return "failed";
+	if (details.status === "cancelled") return "cancelled";
+	if (details.status === "starting") return "starting";
+	const activity = currentActivity(details);
+	if (activity.includes("thinking")) return "thinking";
+	if (activity.includes("analyzing")) return "analyzing";
+	if (activity.includes("working")) return "working";
+	if (activity.includes("reading")) return "reading";
+	if (activity.includes("searching")) return "searching";
+	if (activity.includes("drafting")) return "drafting";
+	return "working";
+}
+
+function shortTask(params: OracleParams, details: OracleDetails): string {
+	return truncateOneLine(params.task, 68);
+}
+
+function collapsedActivityLine(details: OracleDetails, text: string): string {
+	if (details.status === "done") {
+		const toolCount = getAllToolUses(details).length;
+		const usage = details.usage;
+		const parts: string[] = [];
+		if (usage.turns) parts.push(`${usage.turns} turn${usage.turns === 1 ? "" : "s"}`);
+		if (toolCount > 0) parts.push(`${toolCount} tool use${toolCount === 1 ? "" : "s"}`);
+		if (usage.totalTokens) parts.push(`${formatTokens(usage.totalTokens)} tokens`);
+		if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
+		return parts.join(" · ");
+	}
+	if (details.status === "error") {
+		return details.errorMessage || "Oracle process exited with code 1";
+	}
+	if (details.status === "cancelled") {
+		return "cancelled by user";
+	}
+	const active = getActiveToolUses(details).at(-1);
+	if (active) {
+		const usage = details.usage;
+		const parts: string[] = [`using ${formatToolInput(active.name, active.input)}`];
+		if (usage.turns) parts.push(`${usage.turns} turn${usage.turns === 1 ? "" : "s"}`);
+		if (usage.input) parts.push(`${formatTokens(usage.input)}↓`);
+		if (usage.output) parts.push(`${formatTokens(usage.output)}↑`);
+		if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
+		return parts.join(" · ");
+	}
+	return currentActivity(details);
+}
+
+function expandedUsage(usage: UsageStats): string {
+	const parts: string[] = [];
+	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns === 1 ? "" : "s"}`);
+	if (usage.input) parts.push(`${formatTokens(usage.input)} input`);
+	if (usage.output) parts.push(`${formatTokens(usage.output)} output`);
+	if (usage.cacheRead) parts.push(`cache ${formatTokens(usage.cacheRead)}`);
+	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
+	return parts.join(" · ");
+}
+
+function toolStatusGlyph(tool: OracleToolUse): string {
+	if (tool.status === "done") return "✓";
+	if (tool.status === "error") return "✗";
+	if (tool.status === "cancelled") return "■";
+	if (tool.status === "queued") return "·";
+	return ORACLE_SPINNER[Math.floor(Date.now() / 90) % ORACLE_SPINNER.length] ?? "⠋";
+}
+
+function formatTraceTool(tool: OracleToolUse): string {
+	const glyph = toolStatusGlyph(tool);
+	const toolName = tool.name.padEnd(6);
+	const input = formatToolInput(tool.name, tool.input);
+	return `${glyph} ${toolName} ${input}`;
+}
+
+function visibleTools(details: OracleDetails): OracleToolUse[] {
+	return getAllToolUses(details).slice(0, 50);
+}
+
+function answerPreview(details: OracleDetails, text: string): string {
+	if (details.status === "done" && details.finalAnswer) {
+		return details.finalAnswer;
+	}
+	return text || "";
 }
 
 function renderOracleCollapsed(params: OracleParams, details: OracleDetails | undefined, text: string, isPartial: boolean, theme: any): string {
@@ -475,38 +621,23 @@ function renderOracleCollapsed(params: OracleParams, details: OracleDetails | un
 		return text || "Waiting for Oracle...";
 	}
 
+	const width = 78;
 	const glyph = statusGlyph(details);
-	const activity = currentActivity(details);
-	const statusColor = details.status === "error" ? "error" : details.status === "done" ? "success" : "warning";
+	const label = statusLabel(details);
+	const title = `${glyph} Oracle · ${label}`;
+	const task = shortTask(params, details);
+	const activity = collapsedActivityLine(details, text);
+	const hint = details.status === "error" || details.status === "cancelled"
+		? "Ctrl+O for details"
+		: "Ctrl+O to expand";
 
-	if (details.status === "done") {
-		const answer = details.finalAnswer || text;
-		const firstLine = answer.split("\n").map((l: string) => l.trim()).find(Boolean) || "Oracle answered";
-		const summary = firstLine.length > 160 ? `${firstLine.slice(0, 160)}...` : firstLine;
-		const usage = details.usage;
-		const suffix = usage.cost ? ` ($${usage.cost.toFixed(4)})` : "";
-		return `${glyph} ${theme.fg(statusColor, "oracle finished")}${suffix}\n${theme.fg("toolOutput", summary)}`;
-	}
-
-	if (details.status === "error") {
-		const msg = details.errorMessage || "Oracle failed";
-		return `${glyph} ${theme.fg(statusColor, activity)}\n${theme.fg("error", msg)}`;
-	}
-
-	// In-progress
-	const activeTools = getActiveToolUses(details);
-	const lines: string[] = [`${glyph} ${theme.fg(statusColor, `oracle ${activity}`)}`];
-
-	if (activeTools.length > 0) {
-		for (const tool of activeTools.slice(-3)) {
-			lines.push(theme.fg("dim", formatToolInput(tool.name, tool.input)));
-		}
-	}
-
-	const usage = formatUsage(details.usage);
-	if (usage) lines.push(theme.fg("dim", usage));
-
-	return lines.join("\n");
+	return [
+		header(title, width),
+		line(task, width),
+		line(`⎿ ${activity}`, width),
+		lineRight(hint, width),
+		footer(width),
+	].join("\n");
 }
 
 function renderOracleExpanded(params: OracleParams, details: OracleDetails | undefined, text: string, isPartial: boolean, theme: any): string {
@@ -514,66 +645,38 @@ function renderOracleExpanded(params: OracleParams, details: OracleDetails | und
 		return text || "Waiting for Oracle...";
 	}
 
-	const lines: string[] = [];
+	const width = 78;
+	const glyph = statusGlyph(details);
+	const label = statusLabel(details);
+	const title = `${glyph} Oracle · ${label}`;
 
-	// Header
-	lines.push(`${theme.fg("muted", "Task:")} ${truncateOneLine(params.task, 200)}`);
-	lines.push(`${theme.fg("muted", "Model:")} ${details.model} (${details.thinking} thinking)`);
-	const usage = formatUsage(details.usage);
-	if (usage) lines.push(theme.fg("dim", usage));
-	if (details.errorMessage) lines.push(theme.fg("error", details.errorMessage));
+	const lines: string[] = [
+		header(title, width),
+		lineKV("Task", shortTask(params, details), width),
+	];
 
-	// Transcript
-	details.transcript.forEach((turn, index) => {
-		const label = `Step ${index + 1}`;
+	if (details.status !== "done" && details.status !== "error") {
+		lines.push(lineKV("Now", currentActivity(details), width));
+	}
 
-		const activeTools = turn.toolUses.filter((t) => t.status === "in-progress" || t.status === "queued");
-		const doneTools = turn.toolUses.filter((t) => t.status === "done");
-		const errorTools = turn.toolUses.filter((t) => t.status === "error");
+	lines.push(lineKV("Model", `${details.model} · ${details.thinking}`, width));
+	lines.push(lineKV("Usage", expandedUsage(details.usage), width));
+	lines.push(lineRight("Ctrl+O to collapse", width));
 
-		if (turn.isThinking) {
-			lines.push(`\n${theme.fg("warning", `${label}: thinking...`)}`);
-		}
-
-		for (const tool of activeTools) {
-			lines.push(`${theme.fg("warning", `${label}:`)} ${theme.fg("warning", `running ${formatToolInput(tool.name, tool.input)}`)}`);
-		}
-
-		for (const tool of doneTools) {
-			lines.push(`${theme.fg("muted", `${label}:`)} ${theme.fg("success", `done ${formatToolInput(tool.name, tool.input)}`)}`);
-			if (tool.resultPreview) {
-				lines.push(theme.fg("dim", `  ${truncateOneLine(tool.resultPreview, 200)}`));
-			}
-		}
-
-		for (const tool of errorTools) {
-			lines.push(`${theme.fg("muted", `${label}:`)} ${theme.fg("error", `error ${formatToolInput(tool.name, tool.input)}`)}`);
-			if (tool.errorPreview) {
-				lines.push(theme.fg("error", `  ${truncateOneLine(tool.errorPreview, 200)}`));
-			}
-		}
-
-		const message = turn.message.trim();
-		if (message) {
-			lines.push(`${theme.fg("muted", `${label}:`)} ${truncateOneLine(message, 300)}`);
-		}
-	});
-
-	// Final answer or in-progress notice
-	const finalAnswer = (details.finalAnswer || (!isPartial ? text : "")).trim();
-	if (finalAnswer && details.status === "done") {
-		lines.push(`\n${theme.fg("success", "✓ Oracle finished")}${usage ? ` (${usage})` : ""}`);
+	lines.push(section("Trace", width));
+	for (const tool of visibleTools(details)) {
+		lines.push(line(formatTraceTool(tool), width));
 	}
 
 	if (details.status === "error") {
-		lines.push(`\n${theme.fg("error", "✗ Oracle failed")}`);
+		lines.push(section("Details", width));
+		lines.push(...wrapBoxText(details.errorMessage ?? "Oracle failed", width));
+	} else {
+		lines.push(section("Answer", width));
+		lines.push(...wrapBoxText(answerPreview(details, text), width));
 	}
 
-	// Always show the full answer content at the end if available
-	if (finalAnswer) {
-		lines.push(finalAnswer);
-	}
-
+	lines.push(footer(width));
 	return lines.join("\n");
 }
 
