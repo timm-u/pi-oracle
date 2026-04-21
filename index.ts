@@ -410,6 +410,35 @@ function currentActivity(details: OracleDetails): string {
 }
 
 const ORACLE_SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const ORACLE_SPINNER_INTERVAL_MS = 90;
+
+class OracleResultText extends Text {
+	private animationTimer?: ReturnType<typeof setInterval>;
+	private invalidateView?: () => void;
+
+	setAnimating(animating: boolean, invalidateView: () => void) {
+		this.invalidateView = invalidateView;
+		if (!animating) {
+			this.stopAnimating();
+			return;
+		}
+		if (this.animationTimer) return;
+		this.animationTimer = setInterval(() => {
+			this.invalidateView?.();
+		}, ORACLE_SPINNER_INTERVAL_MS);
+		this.animationTimer.unref?.();
+	}
+
+	stopAnimating() {
+		if (!this.animationTimer) return;
+		clearInterval(this.animationTimer);
+		this.animationTimer = undefined;
+	}
+}
+
+function isOracleActive(details: OracleDetails | undefined): boolean {
+	return details?.status === "starting" || details?.status === "in-progress";
+}
 
 function header(title: string, width: number): string {
 	const left = `╭─ ${title} `;
@@ -527,8 +556,7 @@ function statusGlyph(details: OracleDetails): string {
 	if (details.status === "done") return "✓";
 	if (details.status === "error") return "✗";
 	if (details.status === "cancelled") return "■";
-	if (details.status === "starting") return "·";
-	return ORACLE_SPINNER[Math.floor(Date.now() / 90) % ORACLE_SPINNER.length] ?? "⠋";
+	return ORACLE_SPINNER[Math.floor(Date.now() / ORACLE_SPINNER_INTERVAL_MS) % ORACLE_SPINNER.length] ?? "⠋";
 }
 
 function statusLabel(details: OracleDetails): string {
@@ -595,7 +623,7 @@ function toolStatusGlyph(tool: OracleToolUse): string {
 	if (tool.status === "error") return "✗";
 	if (tool.status === "cancelled") return "■";
 	if (tool.status === "queued") return "·";
-	return ORACLE_SPINNER[Math.floor(Date.now() / 90) % ORACLE_SPINNER.length] ?? "⠋";
+	return ORACLE_SPINNER[Math.floor(Date.now() / ORACLE_SPINNER_INTERVAL_MS) % ORACLE_SPINNER.length] ?? "⠋";
 }
 
 function formatTraceTool(tool: OracleToolUse): string {
@@ -614,6 +642,13 @@ function answerPreview(details: OracleDetails, text: string): string {
 		return details.finalAnswer;
 	}
 	return text || "";
+}
+
+function renderOracleResultText(text: string, details: OracleDetails | undefined, isPartial: boolean, context: any): Text {
+	const component = context.lastComponent instanceof OracleResultText ? context.lastComponent : new OracleResultText("", 0, 0);
+	component.setText(text);
+	component.setAnimating(Boolean(isPartial && isOracleActive(details)), context.invalidate);
+	return component;
 }
 
 function renderOracleCollapsed(params: OracleParams, details: OracleDetails | undefined, text: string, isPartial: boolean, theme: any): string {
@@ -985,9 +1020,9 @@ Do not use it for simple file reads/searches, codebase searches the main agent c
 			const details = normalizeOracleDetails(result.details, text);
 			const params = context.args as OracleParams;
 			if (expanded) {
-				return new Text(renderOracleExpanded(params, details, text, isPartial, theme), 0, 0);
+				return renderOracleResultText(renderOracleExpanded(params, details, text, isPartial, theme), details, isPartial, context);
 			}
-			return new Text(renderOracleCollapsed(params, details, text, isPartial, theme), 0, 0);
+			return renderOracleResultText(renderOracleCollapsed(params, details, text, isPartial, theme), details, isPartial, context);
 		},
 	});
 }
